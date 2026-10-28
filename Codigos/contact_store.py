@@ -638,3 +638,135 @@ class ContactStore:
                 )
             )
         return resultado
+
+    # -- exportación --------------------------------------------------------
+    def export_json(self, destino: Optional[Path] = None) -> tuple[Path, int]:
+        destino = Path(destino) if destino else self.exports_dir / "contactos_export.json"
+        contactos = self.list_all()
+        payload = {
+            "generado": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "archivo_origen": self.dat_path.name,
+            "total": len(contactos),
+            "contactos": [c.to_dict() for c in contactos],
+        }
+        _write_text_atomic(destino, json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
+        logger.info("JSON exportado: %s (%d contactos)", destino, len(contactos))
+        return destino, len(contactos)
+
+    def export_pdf_from_json(self, json_path: Path, pdf_path: Optional[Path] = None) -> Path:
+        """Lee el JSON exportado y genera el reporte PDF a partir de él."""
+        json_path = Path(json_path)
+        pdf_path = Path(pdf_path) if pdf_path else self.exports_dir / "reporte_contactos.pdf"
+        try:
+            with _guard(json_path, "leer"):
+                datos = json.loads(json_path.read_text(encoding=ENCODING))
+            filas = datos["contactos"]
+            if not isinstance(filas, list):
+                raise TypeError
+        except (ValueError, KeyError, TypeError) as exc:
+            raise StoreError(f"El JSON «{json_path.name}» es inválido o está corrupto.") from exc
+        _construir_pdf(datos, pdf_path)
+        logger.info("PDF generado: %s", pdf_path)
+        return pdf_path
+
+    def generate_report(
+        self, pdf_path: Optional[Path] = None, json_path: Optional[Path] = None
+    ) -> tuple[Path, Path, int]:
+        """Exporta el JSON y, a partir de él, genera el PDF."""
+        json_final, total = self.export_json(json_path)
+        pdf_final = self.export_pdf_from_json(json_final, pdf_path)
+        return json_final, pdf_final, total
+
+
+# ---------------------------------------------------------------------------
+# Reporte PDF (fpdf2)
+# ---------------------------------------------------------------------------
+_FUENTES_TTF = (
+    ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+    ("/System/Library/Fonts/Supplemental/Arial.ttf", "/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+)
+_ANCHOS_PDF = (14, 50, 30, 64, 32)  # suman 190 mm (A4 con márgenes de 10 mm)
+_TITULOS_PDF = ("ID", "Nombre", "Teléfono", "Correo", "Ciudad")
+
+
+def _construir_pdf(datos: dict, destino: Path) -> None:
+    try:
+        from fpdf import FPDF
+    except ImportError as exc:
+        raise StoreError("Falta la librería fpdf2. Instale con: pip install fpdf2") from exc
+
+    unicode_ok = False
+    familia = "Helvetica"
+
+    class Reporte(FPDF):
+        def footer(self) -> None:
+            self.set_y(-12)
+            self.set_font(familia, "", 8)
+            self.cell(0, 8, f"Página {self.page_no()}/{{nb}}", align="C")
+
+    pdf = Reporte(format="A4")
+    pdf.alias_nb_pages()
+    for regular, negrita in _FUENTES_TTF:
+        if Path(regular).exists() and Path(negrita).exists():
+            try:
+                pdf.add_font("Cuerpo", "", regular)
+                pdf.add_font("Cuerpo", "B", negrita)
+                familia, unicode_ok = "Cuerpo", True
+                break
+            except Exception:  # fuente ilegible: se prueba la siguiente
+                continue
+
+    def t(texto: object) -> str:
+        s = str(texto)
+        return s if unicode_ok else s.encode("latin-1", "replace").decode("latin-1")
+
+    def ajustar(texto: str, ancho: float) -> str:
+        texto = t(texto)
+        while texto and pdf.get_string_width(texto) > ancho - 2:
+            texto = texto[:-1]
+        return texto
+
+    def encabezado_tabla() -> None:
+        pdf.set_font(familia, "B", 9)
+        pdf.set_fill_color(220, 220, 220)
+        for titulo, ancho in zip(_TITULOS_PDF, _ANCHOS_PDF):
+            pdf.cell(ancho, 7, t(titulo), border=1, align="C", fill=True)
+        pdf.ln(7)
+
+    pdf.set_auto_page_break(True, 15)
+    pdf.add_page()
+    pdf.set_font(familia, "B", 16)
+    pdf.cell(0, 10, t("Agenda de Contactos"), align="C")
+    pdf.ln(10)
+    pdf.set_font(familia, "", 10)
+    try:
+        fecha = datetime.fromisoformat(datos.get("generado", "")).strftime("%d/%m/%Y %H:%M:%S")
+    except ValueError:
+        fecha = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    pdf.cell(0, 6, t(f"Fecha de generación: {fecha}"))
+    pdf.ln(6)
+    pdf.cell(0, 6, t(f"Total de contactos: {len(datos['contactos'])}"))
+    pdf.ln(9)
+
+    encabezado_tabla()
+    pdf.set_font(familia, "", 9)
+    for i, fila in enumerate(datos["contactos"]):
+        if pdf.get_y() + 7 > pdf.page_break_trigger:
+            pdf.add_page()
+            encabezado_tabla()
+            pdf.set_font(familia, "", 9)
+        relleno = i % 2 == 1
+        pdf.set_fill_color(245, 245, 245)
+        celdas = (fila.get("id", ""), fila.get("nombre", ""), fila.get("telefono", ""),
+                  fila.get("correo", ""), fila.get("ciudad", ""))
+        for j, (valor, ancho) in enumerate(zip(celdas, _ANCHOS_PDF)):
+            pdf.cell(ancho, 7, ajustar(str(valor), ancho), border=1,
+                     align="C" if j == 0 else "L", fill=relleno)
+        pdf.ln(7)
+
+    tmp = destino.with_name(destino.name + ".tmp")
+    with _guard(destino, "escribir"):
+        destino.parent.mkdir(parents=True, exist_ok=True)
+        pdf.output(str(tmp))
+        os.replace(tmp, destino)
