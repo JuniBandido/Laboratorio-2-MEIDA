@@ -303,3 +303,338 @@ def compute_hash(path: Path) -> str:
 class _IndexProblem(Exception):
     """Interno: el índice no existe, no se puede leer o es inválido."""
 
+
+# ---------------------------------------------------------------------------
+# Almacén principal
+# ---------------------------------------------------------------------------
+class ContactStore:
+    def __init__(self, data_dir: str | Path):
+        self.data_dir = Path(data_dir)
+        self.dat_path = self.data_dir / DAT_NAME
+        self.index_path = self.data_dir / INDEX_NAME
+        self.hash_path = self.data_dir / HASH_NAME
+        self.exports_dir = self.data_dir / "exports"
+        self.backups_dir = self.data_dir / "backups"
+        self._index: dict[int, int] = {}
+
+    # -- arranque -----------------------------------------------------------
+    def initialize(self) -> StartupReport:
+        """Prepara carpeta, verifica el hash y carga (o reconstruye) el índice.
+        Nunca lanza por archivos ausentes/corruptos: devuelve avisos."""
+        avisos: list[str] = []
+        with _guard(self.data_dir, "crear la carpeta de datos"):
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        configure_logging(self.data_dir)
+        logger.info("Inicio de la aplicación. Datos en %s", self.data_dir)
+
+        try:
+            integridad = self.verify_integrity()
+        except StoreError as exc:
+            integridad = IntegrityReport(
+                IntegrityStatus.HASH_INVALIDO, None, None, str(exc)
+            )
+        if integridad.estado == IntegrityStatus.SIN_HASH:
+            try:
+                self.seal()
+                avisos.append("No existía contactos.sha256; se generó con el estado actual.")
+            except StoreError as exc:
+                avisos.append(str(exc))
+        elif not integridad.ok and integridad.estado != IntegrityStatus.SIN_ARCHIVO:
+            avisos.append(integridad.mensaje)
+
+        avisos.extend(self._load_index())
+        return StartupReport(integridad, avisos)
+
+    # -- conteos ------------------------------------------------------------
+    def _record_count(self) -> int:
+        with _guard(self.dat_path, "leer"):
+            try:
+                size = self.dat_path.stat().st_size
+            except FileNotFoundError:
+                return 0
+        if size % RECORD_SIZE:
+            raise DataFileCorruptError(
+                f"«{self.dat_path.name}» está corrupto: su tamaño ({size} bytes) no es "
+                f"múltiplo del tamaño de registro ({RECORD_SIZE} bytes)."
+            )
+        return size // RECORD_SIZE
+
+    def count(self) -> int:
+        return len(self._index)
+
+    def next_id(self) -> int:
+        return (max(self._index) + 1) if self._index else 1
+
+    def record_number(self, contact_id: int) -> Optional[int]:
+        return self._index.get(contact_id)
+
+    # -- índice -------------------------------------------------------------
+    def _read_index_file(self) -> dict[int, int]:
+        try:
+            with _guard(self.index_path, "leer"):
+                texto = self.index_path.read_text(encoding=ENCODING)
+        except StorePermissionError as exc:
+            raise _IndexProblem("no se puede leer (sin permisos)") from exc
+        except StoreError as exc:
+            if not self.index_path.exists():
+                raise _IndexProblem("no existe") from exc
+            raise _IndexProblem("no se puede leer") from exc
+        except UnicodeDecodeError as exc:
+            raise _IndexProblem("está corrupto") from exc
+        try:
+            datos = json.loads(texto)
+            if datos.get("version") != INDEX_VERSION:
+                raise ValueError("versión desconocida")
+            crudo = datos["indice"]
+            return {int(k): int(v) for k, v in crudo.items()}
+        except (ValueError, KeyError, TypeError, AttributeError, UnicodeDecodeError) as exc:
+            raise _IndexProblem("está corrupto") from exc
+
+    def _save_index(self) -> None:
+        payload = {
+            "version": INDEX_VERSION,
+            "tamano_registro": RECORD_SIZE,
+            "total": len(self._index),
+            "indice": {str(k): v for k, v in sorted(self._index.items())},
+        }
+        _write_text_atomic(
+            self.index_path, json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
+        )
+
+    def _load_index(self) -> list[str]:
+        try:
+            n = self._record_count()
+        except StoreError as exc:
+            self._index = {}
+            logger.error("Archivo de datos inválido al iniciar: %s", exc)
+            return [str(exc)]
+        motivo = ""
+        try:
+            idx = self._read_index_file()
+            if len(idx) == n and set(idx.values()) == set(range(n)):
+                self._index = idx
+                return []
+            motivo = "no coincide con el archivo de contactos"
+        except _IndexProblem as exc:
+            motivo = str(exc)
+            if motivo == "no existe" and n == 0:
+                self._index = {}
+                return []
+        try:
+            total = self.rebuild_index()
+        except StoreError as exc:
+            self._index = {}
+            return [f"El índice {motivo} y no se pudo reconstruir: {exc}"]
+        logger.warning("Índice %s; reconstruido (%d registros)", motivo, total)
+        return [f"El índice {motivo}; se reconstruyó leyendo contactos.dat ({total} registros)."]
+
+    def rebuild_index(self) -> int:
+        """Reconstruye el índice recorriendo contactos.dat registro por registro."""
+        n = self._record_count()
+        nuevo: dict[int, int] = {}
+        if n:
+            with _guard(self.dat_path, "leer"):
+                with open(self.dat_path, "rb") as f:
+                    for pos in range(n):
+                        f.seek(pos * RECORD_SIZE)
+                        c = decode_record(f.read(RECORD_SIZE), pos)
+                        if c.id in nuevo:
+                            raise DataFileCorruptError(
+                                f"ID {c.id} duplicado en los registros #{nuevo[c.id]} y #{pos}."
+                            )
+                        nuevo[c.id] = pos
+        self._index = nuevo
+        if n or self.index_path.exists():
+            self._save_index()
+        return len(nuevo)
+
+    # -- lectura / escritura de registros -----------------------------------
+    def _read_record(self, pos: int) -> tuple[Contact, AccessTrace]:
+        traza = AccessTrace("LEER", pos, pos * RECORD_SIZE)
+        with _guard(self.dat_path, "leer"):
+            with open(self.dat_path, "rb") as f:
+                f.seek(traza.offset)
+                traza.tell_antes = f.tell()
+                raw = f.read(RECORD_SIZE)
+                traza.tell_despues = f.tell()
+        traza.bytes_io = len(raw)
+        return decode_record(raw, pos), traza
+
+    def get(self, contact_id: int) -> tuple[Contact, AccessTrace]:
+        """Búsqueda por id: primero el índice, luego seek() al registro."""
+        for intento in range(2):
+            pos = self._index.get(contact_id)
+            if pos is None or not self.dat_path.exists():
+                break
+            contacto, traza = self._read_record(pos)
+            if contacto.id == contact_id:
+                return contacto, traza
+            logger.warning("Índice desactualizado (id %s); se reconstruye", contact_id)
+            self.rebuild_index()
+        raise ContactNotFoundError(f"No existe ningún contacto con ID {contact_id}.")
+
+    def add(self, contacto: Contact) -> AccessTrace:
+        c = contacto.normalizado()
+        c.validar()
+        if c.id in self._index:
+            raise DuplicateIdError(f"Ya existe un contacto con ID {c.id}.")
+        n = self._record_count()
+        traza = AccessTrace("AGREGAR", n, n * RECORD_SIZE)
+        raw = encode_record(c)
+        with _guard(self.dat_path, "escribir en"):
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            modo = "r+b" if self.dat_path.exists() else "w+b"
+            with open(self.dat_path, modo) as f:
+                f.seek(traza.offset)
+                traza.tell_antes = f.tell()
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+                traza.tell_despues = f.tell()
+        traza.bytes_io = len(raw)
+        self.seal()
+        self._index[c.id] = n
+        self._save_index()
+        logger.info("Contacto agregado: id=%s registro=%s", c.id, n)
+        return traza
+
+    def update(self, contacto: Contact) -> AccessTrace:
+        """Sobrescribe SOLO el registro del contacto; el resto no se reescribe."""
+        c = contacto.normalizado()
+        c.validar()
+        pos = self._index.get(c.id)
+        if pos is None or not self.dat_path.exists():
+            raise ContactNotFoundError(f"No existe ningún contacto con ID {c.id}.")
+        traza = AccessTrace("MODIFICAR", pos, pos * RECORD_SIZE)
+        raw = encode_record(c)
+        with _guard(self.dat_path, "escribir en"):
+            with open(self.dat_path, "r+b") as f:
+                f.seek(traza.offset)
+                actual = decode_record(f.read(RECORD_SIZE), pos)
+                if actual.id != c.id:
+                    raise DataFileCorruptError(
+                        "El índice no coincide con el archivo; use Herramientas > "
+                        "Verificar integridad para reconstruirlo."
+                    )
+                f.seek(traza.offset)
+                traza.tell_antes = f.tell()
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+                traza.tell_despues = f.tell()
+        traza.bytes_io = len(raw)
+        self.seal()
+        logger.info("Contacto modificado: id=%s registro=%s", c.id, pos)
+        return traza
+
+    def list_all(self) -> list[Contact]:
+        """Lectura secuencial de todos los registros (para tabla y exportación)."""
+        n = self._record_count()
+        contactos: list[Contact] = []
+        if not n:
+            return contactos
+        with _guard(self.dat_path, "leer"):
+            with open(self.dat_path, "rb") as f:
+                for pos in range(n):
+                    contactos.append(decode_record(f.read(RECORD_SIZE), pos))
+        return contactos
+
+    # -- integridad ---------------------------------------------------------
+    def seal(self) -> str:
+        """Calcula el SHA-256 de contactos.dat y lo guarda en contactos.sha256."""
+        if not self.dat_path.exists():
+            return ""
+        digest = compute_hash(self.dat_path)
+        _write_text_atomic(self.hash_path, f"{digest}  {self.dat_path.name}\n")
+        return digest
+
+    def verify_integrity(self) -> IntegrityReport:
+        if not self.dat_path.exists():
+            return IntegrityReport(
+                IntegrityStatus.SIN_ARCHIVO, None, None,
+                "Aún no existe contactos.dat (no hay nada que verificar).",
+            )
+        actual = compute_hash(self.dat_path)
+        try:
+            with _guard(self.hash_path, "leer"):
+                texto = self.hash_path.read_text(encoding=ENCODING)
+        except StorePermissionError:
+            raise
+        except StoreError:
+            if not self.hash_path.exists():
+                return IntegrityReport(
+                    IntegrityStatus.SIN_HASH, None, actual,
+                    "No existe contactos.sha256; no se puede comparar.",
+                )
+            raise
+        except UnicodeDecodeError:
+            texto = ""
+        partes = texto.split()
+        guardado = partes[0].lower() if partes else ""
+        if not re.fullmatch(r"[0-9a-f]{64}", guardado):
+            return IntegrityReport(
+                IntegrityStatus.HASH_INVALIDO, None, actual,
+                "contactos.sha256 está dañado o no contiene un SHA-256 válido.",
+            )
+        if guardado == actual:
+            return IntegrityReport(
+                IntegrityStatus.OK, guardado, actual,
+                "Integridad correcta: el hash SHA-256 coincide.",
+            )
+        logger.warning("Hash no coincide: guardado=%s actual=%s", guardado, actual)
+        return IntegrityReport(
+            IntegrityStatus.MODIFICADO, guardado, actual,
+            "⚠ contactos.dat fue modificado fuera de la aplicación: "
+            "el hash SHA-256 no coincide con el guardado.",
+        )
+
+    def accept_current_state(self) -> int:
+        """Acepta el archivo tal como está: reconstruye el índice y renueva el hash."""
+        total = self.rebuild_index()
+        self.seal()
+        logger.warning("Estado actual aceptado por el usuario (%d registros)", total)
+        return total
+
+    # -- respaldo -----------------------------------------------------------
+    def create_backup(self) -> BackupResult:
+        if not self.dat_path.exists():
+            raise StoreError("No hay contactos.dat para respaldar todavía.")
+        with _guard(self.backups_dir, "crear la carpeta de"):
+            self.backups_dir.mkdir(parents=True, exist_ok=True)
+        base = f"respaldo_{datetime.now():%Y%m%d_%H%M%S}"
+        destino = self.backups_dir / f"{base}.zip"
+        k = 1
+        while destino.exists():
+            destino = self.backups_dir / f"{base}_{k}.zip"
+            k += 1
+        fuentes = [self.dat_path] + ([self.index_path] if self.index_path.exists() else [])
+        original = 0
+        comprimido = 0
+        with _guard(destino, "crear"):
+            with zipfile.ZipFile(destino, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
+                for fuente in fuentes:
+                    z.write(fuente, arcname=fuente.name)
+                for info in z.infolist():
+                    original += info.file_size
+                    comprimido += info.compress_size
+            zip_size = destino.stat().st_size
+        logger.info("Respaldo creado: %s (%d -> %d bytes)", destino, original, zip_size)
+        return BackupResult(destino, original, comprimido, zip_size, [f.name for f in fuentes])
+
+    # -- metadatos ----------------------------------------------------------
+    def file_info(self) -> list[FileInfo]:
+        resultado = []
+        for ruta in (self.dat_path, self.index_path, self.hash_path):
+            try:
+                st = os.stat(ruta)
+            except OSError:
+                resultado.append(FileInfo(ruta.name, ruta, False))
+                continue
+            resultado.append(
+                FileInfo(
+                    ruta.name, ruta, True, st.st_size,
+                    datetime.fromtimestamp(st.st_mtime),
+                    os.access(ruta, os.R_OK), os.access(ruta, os.W_OK),
+                )
+            )
+        return resultado
