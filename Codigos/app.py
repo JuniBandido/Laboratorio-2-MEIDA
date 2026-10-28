@@ -357,3 +357,97 @@ class MainApp(tb.Window):
             )
         except StoreError as exc:
             self.lbl_integridad.configure(text=f"⚠  {exc}", bootstyle="danger")
+
+    # -- menú Contactos -----------------------------------------------------
+    def abrir_contactos(self, modo: str = "agregar"):
+        if self.contactos_win is None or not self.contactos_win.winfo_exists():
+            self.contactos_win = ContactsWindow(self)
+        self.contactos_win.enfocar(modo)
+
+    # -- menú Exportar ------------------------------------------------------
+    @manejar_errores("Error al exportar")
+    def exportar_json(self):
+        self.store.exports_dir.mkdir(parents=True, exist_ok=True)
+        ruta = filedialog.asksaveasfilename(
+            parent=self, title="Exportar a JSON", defaultextension=".json",
+            initialdir=self.store.exports_dir, initialfile="contactos_export.json",
+            filetypes=[("JSON", "*.json")])
+        if not ruta:
+            return
+        destino, total = self.store.export_json(Path(ruta))
+        messagebox.showinfo("Exportación completa",
+                            f"Se exportaron {total} contactos a:\n{destino}", parent=self)
+
+    @manejar_errores("Error al generar el PDF")
+    def generar_pdf(self):
+        self.store.exports_dir.mkdir(parents=True, exist_ok=True)
+        ruta = filedialog.asksaveasfilename(
+            parent=self, title="Generar reporte PDF", defaultextension=".pdf",
+            initialdir=self.store.exports_dir, initialfile="reporte_contactos.pdf",
+            filetypes=[("PDF", "*.pdf")])
+        if not ruta:
+            return
+        pdf = Path(ruta)
+        json_ruta, pdf_ruta, total = self.store.generate_report(pdf, pdf.with_suffix(".json"))
+        messagebox.showinfo(
+            "Reporte generado",
+            f"{total} contactos.\n\nJSON: {json_ruta}\nPDF: {pdf_ruta}", parent=self)
+
+    # -- menú Herramientas --------------------------------------------------
+    @manejar_errores("Error de integridad")
+    def verificar_integridad(self):
+        rep = self.store.verify_integrity()
+        if rep.ok:
+            messagebox.showinfo("Integridad", f"{rep.mensaje}\n\nSHA-256:\n{rep.hash_actual}", parent=self)
+        elif rep.estado == IntegrityStatus.SIN_ARCHIVO:
+            messagebox.showinfo("Integridad", rep.mensaje, parent=self)
+        else:
+            detalle = rep.mensaje
+            if rep.hash_guardado:
+                detalle += f"\n\nHash guardado:\n{rep.hash_guardado}"
+            if rep.hash_actual:
+                detalle += f"\n\nHash actual:\n{rep.hash_actual}"
+            detalle += ("\n\n¿Desea aceptar el archivo tal como está? "
+                        "Se reconstruirá el índice y se renovará el hash.")
+            if messagebox.askyesno("Integridad", detalle, icon="warning", parent=self):
+                total = self.store.accept_current_state()
+                messagebox.showinfo("Integridad", f"Estado aceptado ({total} registros). Hash renovado.", parent=self)
+        self.refrescar_estado()
+        if self.contactos_win is not None and self.contactos_win.winfo_exists():
+            self.contactos_win.refrescar_tabla()
+
+    @manejar_errores("Error al crear el respaldo")
+    def crear_respaldo(self):
+        r = self.store.create_backup()
+        messagebox.showinfo(
+            "Respaldo creado",
+            f"Archivo: {r.ruta}\nContiene: {', '.join(r.archivos)}\n\n"
+            f"Tamaño original:     {formato_bytes(r.tamano_original)}\n"
+            f"Tamaño comprimido:   {formato_bytes(r.tamano_comprimido)}\n"
+            f"Tamaño del ZIP:      {formato_bytes(r.tamano_zip)}\n"
+            f"Reducción:           {r.ahorro_pct:.1f} %",
+            parent=self)
+
+    @manejar_errores("Error")
+    def mostrar_info(self):
+        InfoWindow(self)
+
+    # -- menú Ayuda (simulado) ---------------------------------------------
+    def _ayuda_simulada(self):
+        messagebox.showinfo("Ayuda", "Esta opción de ayuda es simulada en el laboratorio.", parent=self)
+
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Agenda de Contactos - Laboratorio 2")
+    p.add_argument("--data-dir", type=str, default=str(DEFAULT_DATA_DIR),
+                   help="Carpeta donde se guardan contactos.dat, indice.json y contactos.sha256.")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    MainApp(Path(args.data_dir)).mainloop()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
