@@ -766,6 +766,8 @@ def _construir_pdf(datos: dict, destino: Path) -> None:
         pdf.ln(7)
 
     tmp = destino.with_name(destino.name + ".tmp")
+
+    
     with _guard(destino, "escribir"):
         destino.parent.mkdir(parents=True, exist_ok=True)
         pdf.output(str(tmp))
